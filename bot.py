@@ -22,7 +22,7 @@ JST = datetime.timezone(datetime.timedelta(hours=9))
 
 TIME_SLOTS = ["21", "22", "23"]
 
-# 試合開始時刻の7分前に締切（時と分で管理）
+# 締切時刻（時、分）
 DEADLINES = {
     "21": (20, 53),
     "22": (21, 53),
@@ -319,7 +319,7 @@ async def get_text_channel(guild, channel_id):
 
 
 # ============================================================
-# 挙手一覧
+# 挙手一覧の投稿・更新（毎回古いものを消して新しく投稿する）
 # ============================================================
 
 async def refresh_gesture_status(guild):
@@ -331,20 +331,23 @@ async def refresh_gesture_status(guild):
     if channel is None:
         return
 
+    # チャンネル内の過去のBotによる挙手一覧メッセージを検索して削除
     try:
-        async for msg in channel.history(limit=50):
-            if msg.author == bot.user and msg.embeds and msg.embeds[0].title == "MKUC 本日の挙手状況":
-                try:
-                    await msg.delete()
-                except Exception:
-                    pass
+        async for msg in channel.history(limit=30):
+            if msg.author == bot.user and msg.embeds:
+                embed = msg.embeds[0]
+                if embed.title and "挙手状況" in embed.title:
+                    try:
+                        await msg.delete()
+                    except discord.HTTPException:
+                        pass
     except Exception:
         pass
 
     today = today_str()
     embed = discord.Embed(
-        title="MKUC 本日の挙手状況",
-        description="チームごとの挙手状況です。",
+        title="📅 MKUC 本日の挙手状況一覧",
+        description="現在の各時間帯の挙手チーム一覧です。",
         color=discord.Color.blue(),
         timestamp=now_jst(),
     )
@@ -368,13 +371,21 @@ async def refresh_gesture_status(guild):
         else:
             status = "受付中"
 
-        team_text = "\n".join([guild.get_role(rid).mention for rid in role_ids if guild.get_role(rid)]) if role_ids else "なし"
+        team_lines = []
+        for rid in role_ids:
+            role = guild.get_role(rid)
+            if role:
+                team_lines.append(role.mention)
+
+        team_text = "\n".join(team_lines) if team_lines else "なし"
 
         embed.add_field(
-            name=f"{slot}時枠（{status}）・{len(role_ids)}チーム",
+            name=f"🕒 {slot}時枠（{status}）: {len(role_ids)}チーム",
             value=team_text,
             inline=False,
         )
+
+    embed.set_footer(text="MKUC 2026 | 挙手/取り下げごとに自動更新されます")
 
     try:
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
@@ -443,6 +454,7 @@ async def c_uc(interaction: discord.Interaction, times: str):
         )
         registered.append(slot)
 
+    # 挙手状況一覧をチャンネルに再投稿（古いものは削除）
     if registered:
         await refresh_gesture_status(interaction.guild)
 
@@ -486,6 +498,7 @@ async def d_uc(interaction: discord.Interaction, time_slot: app_commands.Choice[
         (interaction.guild.id, today_str(), slot, team_role.id),
     )
 
+    # 挙手状況一覧をチャンネルに再投稿（古いものは削除）
     await refresh_gesture_status(interaction.guild)
     await interaction.response.send_message(f"🗑️ {team_role.name} の {slot}時枠の挙手を取り下げました。", ephemeral=True)
 
@@ -546,14 +559,13 @@ async def clear_uc(interaction: discord.Interaction):
 
 
 # ============================================================
-# 定期ループ処理（マッチング等）
+# 定期ループ処理
 # ============================================================
 
 @tasks.loop(seconds=30)
 async def scheduler():
     current = now_jst()
     date_str = current.strftime("%Y-%m-%d")
-    current_time = current.time()
 
     for guild in bot.guilds:
         config = get_config(guild.id)
@@ -577,13 +589,6 @@ async def scheduler():
                 yesterday = (current.date() - datetime.timedelta(days=1)).isoformat()
                 db_execute("DELETE FROM gestures WHERE guild_id=? AND date=?", (guild.id, yesterday))
                 set_setting(guild.id, key, "true")
-
-        # 時間枠ごとの処理
-        for slot in TIME_SLots if 'TIME_SLOTS' in globals() else TIME_SLOTS:
-            m_h, m_m = MATCH_TIMES[slot]
-            if current.hour == m_h and current.minute == m_m:
-                # 簡易マッチング処理実行
-                pass
 
 
 @scheduler.before_loop
