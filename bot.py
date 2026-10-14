@@ -545,7 +545,7 @@ async def c_uc(
         return
 
     today = today_str()
-    current = now_jst().time()
+    current = now_jst().time().replace(tzinfo=None)
 
     registered = []
     rejected = []
