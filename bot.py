@@ -1,411 +1,1533 @@
 import asyncio
 import datetime
 import os
+import random
 import sqlite3
-import aiohttp
-from aiohttp import web
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from aiohttp import web
 
-# --- 設定 ---
-TOKEN = os.getenv("DISCORD_TOKEN")  # Render等の環境変数から取得、または直接文字列で代入
-PORT = int(os.getenv("PORT", 8080))
 
-# データベースの初期化
-db_conn = sqlite3.connect("mkuc_bot.db", check_same_thread=False)
-db_cursor = db_conn.cursor()
+# ============================================================
+# 設定
+# ============================================================
 
-db_cursor.execute(
+TOKEN = os.getenv("DISCORD_TOKEN")
+PORT = int(os.getenv("PORT", "8080"))
+
+JST = datetime.timezone(datetime.timedelta(hours=9))
+
+# 使用する時間帯
+TIME_SLOTS = ["21", "22", "23"]
+
+# 試合開始時刻の7分前に締切
+DEADLINES = {
+    "21": datetime.time(20, 53, tzinfo=JST),
+    "22": datetime.time(21, 53, tzinfo=JST),
+    "23": datetime.time(22, 53, tzinfo=JST),
+}
+
+# マッチング時刻
+MATCH_TIMES = {
+    "21": datetime.time(20, 55, tzinfo=JST),
+    "22": datetime.time(21, 55, tzinfo=JST),
+    "23": datetime.time(22, 55, tzinfo=JST),
+}
+
+# 部屋作成時刻
+ROOM_TIMES = {
+    "21": datetime.time(20, 58, tzinfo=JST),
+    "22": datetime.time(21, 58, tzinfo=JST),
+    "23": datetime.time(22, 58, tzinfo=JST),
+}
+
+# 運営設定
+DB_PATH = os.getenv("MKUC_DB_PATH", "mkuc_bot.db")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+log = logging.getLogger("MKUC")
+
+
+# ============================================================
+# データベース
+# ============================================================
+
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+db.execute("PRAGMA journal_mode=WAL")
+
+db.executescript(
     """
     CREATE TABLE IF NOT EXISTS scores (
-        role_id INTEGER PRIMARY KEY,
-        points INTEGER DEFAULT 0
-    )
-"""
-)
-db_cursor.execute(
-    """
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )
-"""
-)
-# 初期設定: お休み優先機能はデフォルトでON ("true")
-db_cursor.execute(
-    "INSERT OR IGNORE INTO settings (key, value) VALUES ('prioritize_2000', 'true')"
-)
-db_conn.commit()
+        guild_id INTEGER NOT NULL,
+        role_id INTEGER NOT NULL,
+        points INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (guild_id, role_id)
+    );
 
-# メモリ上の挙手データ構造: { date_str: { time_slot: [role_id, ...] } }
-# 例: {"2026-10-19": {"21": [123456789, 987654321], "22": [...]}}
-gestures = {}
+    CREATE TABLE IF NOT EXISTS settings (
+        guild_id INTEGER NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (guild_id, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS team_roles (
+        guild_id INTEGER NOT NULL,
+        role_id INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, role_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS guild_config (
+        guild_id INTEGER PRIMARY KEY,
+        signup_channel_id INTEGER,
+        participant_role_id INTEGER,
+        room_category_id INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS gestures (
+        guild_id INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        role_id INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, date, slot, role_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS daily_status (
+        guild_id INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        matched INTEGER NOT NULL DEFAULT 0,
+        rooms_created INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (guild_id, date, slot)
+    );
+
+    CREATE TABLE IF NOT EXISTS matches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        room_number INTEGER NOT NULL,
+        team1_id INTEGER NOT NULL,
+        team2_id INTEGER NOT NULL,
+        host_id INTEGER NOT NULL,
+        channel_id INTEGER,
+        UNIQUE (guild_id, date, slot, room_number)
+    );
+
+    CREATE TABLE IF NOT EXISTS match_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        team1_id INTEGER NOT NULL,
+        team2_id INTEGER NOT NULL
+    );
+    """
+)
+
+db.commit()
+
+
+def db_execute(query, params=()):
+    cur = db.execute(query, params)
+    db.commit()
+    return cur
+
+
+def now_jst():
+    return datetime.datetime.now(JST)
+
+
+def today_str():
+    return now_jst().strftime("%Y-%m-%d")
+
+
+def get_setting(guild_id, key, default="false"):
+    row = db.execute(
+        "SELECT value FROM settings WHERE guild_id=? AND key=?",
+        (guild_id, key),
+    ).fetchone()
+
+    return row[0] if row else default
+
+
+def set_setting(guild_id, key, value):
+    db_execute(
+        """
+        INSERT INTO settings (guild_id, key, value)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, key)
+        DO UPDATE SET value=excluded.value
+        """,
+        (guild_id, key, str(value)),
+    )
+
+
+def get_points(guild_id, role_id):
+    row = db.execute(
+        "SELECT points FROM scores WHERE guild_id=? AND role_id=?",
+        (guild_id, role_id),
+    ).fetchone()
+
+    return row[0] if row else 0
+
+
+def add_points(guild_id, role_id, points):
+    current = get_points(guild_id, role_id)
+
+    db_execute(
+        """
+        INSERT INTO scores (guild_id, role_id, points)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, role_id)
+        DO UPDATE SET points=excluded.points
+        """,
+        (guild_id, role_id, current + points),
+    )
+
+    return current + points
+
+
+def set_points(guild_id, role_id, points):
+    db_execute(
+        """
+        INSERT INTO scores (guild_id, role_id, points)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, role_id)
+        DO UPDATE SET points=excluded.points
+        """,
+        (guild_id, role_id, points),
+    )
+
+
+def get_config(guild_id):
+    row = db.execute(
+        """
+        SELECT signup_channel_id,
+               participant_role_id,
+               room_category_id
+        FROM guild_config
+        WHERE guild_id=?
+        """,
+        (guild_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "signup_channel_id": row[0],
+        "participant_role_id": row[1],
+        "room_category_id": row[2],
+    }
+
+
+def set_config(
+    guild_id,
+    signup_channel_id,
+    participant_role_id,
+    room_category_id,
+):
+    db_execute(
+        """
+        INSERT INTO guild_config (
+            guild_id,
+            signup_channel_id,
+            participant_role_id,
+            room_category_id
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id)
+        DO UPDATE SET
+            signup_channel_id=excluded.signup_channel_id,
+            participant_role_id=excluded.participant_role_id,
+            room_category_id=excluded.room_category_id
+        """,
+        (
+            guild_id,
+            signup_channel_id,
+            participant_role_id,
+            room_category_id,
+        ),
+    )
+
+
+def get_team_role_ids(guild_id):
+    rows = db.execute(
+        "SELECT role_id FROM team_roles WHERE guild_id=?",
+        (guild_id,),
+    ).fetchall()
+
+    return {row[0] for row in rows}
+
+
+def register_team_role(guild_id, role_id):
+    db_execute(
+        """
+        INSERT OR IGNORE INTO team_roles (guild_id, role_id)
+        VALUES (?, ?)
+        """,
+        (guild_id, role_id),
+    )
+
+
+def unregister_team_role(guild_id, role_id):
+    db_execute(
+        "DELETE FROM team_roles WHERE guild_id=? AND role_id=?",
+        (guild_id, role_id),
+    )
+
+
+# ============================================================
+# Bot初期化
+# ============================================================
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # メンバー情報を取得するため必須
-intents.message_content = True
+intents.members = True
 
-class MKUCBot(commands.Bot):
-
-    def __init__(self):
-        super().__init__(command_prefix="/", intents=intents)
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        print("スラッシュコマンドが同期されました。")
-
-bot = MKUCBot()
-
-# --- Webスリープ対策用簡易Webサーバー (Render等対応) ---
-async def handle(request):
-    return web.Response(text="MKUC 2026 Bot is running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.add_routes([web.get("/", handle)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"Web server started on port {PORT}")
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+)
 
 
-# --- ユーティリティ関数 ---
-def get_today_str():
-    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y-%m-%d")
+# ============================================================
+# 共通処理
+# ============================================================
 
-def get_team_points(role_id: int) -> int:
-    db_cursor.execute("SELECT points FROM scores WHERE role_id = ?", (role_id,))
-    res = db_cursor.fetchone()
-    return res[0] if res else 0
-
-def set_team_points(role_id: int, points: int):
-    db_cursor.execute(
-        "INSERT OR REPLACE INTO scores (role_id, points) VALUES (?, ?)",
-        (role_id, points),
+def is_admin(interaction: discord.Interaction):
+    return (
+        interaction.guild is not None
+        and interaction.user.guild_permissions.manage_guild
     )
-    db_conn.commit()
 
-def add_team_points(role_id: int, add_pts: int):
-    current = get_team_points(role_id)
-    set_team_points(role_id, current + add_pts)
 
-def get_setting(key: str) -> str:
-    db_cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    res = db_cursor.fetchone()
-    return res[0] if res else "false"
+async def require_admin(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "このコマンドはサーバー管理権限を持つ運営のみ使用できます。",
+            ephemeral=True,
+        )
+        return False
 
-def set_setting(key: str, value: str):
-    db_cursor.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+    return True
+
+
+def get_member_team_roles(interaction: discord.Interaction):
+    guild_id = interaction.guild_id
+    registered = get_team_role_ids(guild_id)
+
+    return [
+        role
+        for role in interaction.user.roles
+        if role.id in registered
+    ]
+
+
+def get_team_role_from_interaction(interaction):
+    roles = get_member_team_roles(interaction)
+
+    if len(roles) == 0:
+        return None, "あなたにチームロールが設定されていません。"
+
+    if len(roles) > 1:
+        return None, (
+            "複数のチームロールを持っています。"
+            "運営にチームロールの設定を確認してもらってください。"
+        )
+
+    return roles[0], None
+
+
+async def get_text_channel(guild, channel_id):
+    if not channel_id:
+        return None
+
+    channel = guild.get_channel(channel_id)
+
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+
+    if not isinstance(channel, discord.TextChannel):
+        return None
+
+    return channel
+
+
+# ============================================================
+# 挙手一覧
+# ============================================================
+
+async def refresh_gesture_status(guild):
+    config = get_config(guild.id)
+
+    if not config:
+        return
+
+    channel = await get_text_channel(
+        guild,
+        config["signup_channel_id"],
     )
-    db_conn.commit()
 
+    if channel is None:
+        log.warning("挙手チャンネルが見つかりません: %s", guild.id)
+        return
 
-# --- 挙手一覧メッセージの送受信管理（チャンネル内過去一覧の削除付き） ---
-async def send_gesture_status(channel: discord.TextChannel):
-    today = get_today_str()
-    if today not in gestures or not gestures[today]:
-        embed = discord.Embed(
-            title="📅 本日の挙手状況", description="現在、どの時間帯も挙手されていません。", color=discord.Color.blue()
-        )
-    else:
-        embed = discord.Embed(
-            title="📅 本日の挙手状況一覧", color=discord.Color.blue()
-        )
-        for slot in sorted(gestures[today].keys(), key=int):
-            role_ids = gestures[today][slot]
-            if not role_ids:
-                team_list = "なし"
-            else:
-                team_list = ", ".join([f"<@&{rid}>" for rid in role_ids])
-            embed.add_field(name=f"🕒 {slot}時枠", value=team_list, inline=False)
-
-    # チャンネル内の過去のBotメッセージを検索して削除（取り消し処理）
+    # 前回の一覧メッセージを削除
+    # 直近のメッセージのみを調べる
     try:
-        async for msg in channel.history(limit=20):
-            if msg.author == bot.user and msg.embeds:
-                if msg.embeds[0].title and "挙手状況" in msg.embeds[0].title:
+        async for msg in channel.history(limit=50):
+            if msg.author != bot.user:
+                continue
+
+            if not msg.embeds:
+                continue
+
+            embed = msg.embeds[0]
+
+            if embed.title == "MKUC 本日の挙手状況":
+                try:
                     await msg.delete()
-    except Exception as e:
-        print(f"メッセージ削除エラー: {e}")
+                except discord.HTTPException:
+                    pass
 
-    await channel.send(embed=embed)
+    except discord.HTTPException:
+        log.exception("挙手一覧の削除に失敗しました")
 
+    today = today_str()
 
-# --- 毎日12:00の自動アナウンス ---
-@tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=datetime.timezone(datetime.timedelta(hours=9))))
-async def daily_announcement():
-    # 適切な告知チャンネルをGuildから探して送信（最初に見つかったテキストチャンネル、または特定の名前のチャンネル）
-    for guild in bot.guilds:
-        target_channel = discord.utils.get(guild.text_channels, name="募集-挙手") # 見つからなければ一般的なチャンネル
-        if not target_channel:
-            for ch in guild.text_channels:
-                if ch.permissions_for(guild.me).send_messages:
-                    target_channel = ch
-                    break
-        if target_channel:
-            # サーバーメンバー全員（あるいは参加者ロール）をメンション
-            await target_channel.send(
-                f"@everyone 12時になりましたので、本日の募集を開始します！\n"
-                f"`/c-uc` コマンドで参加したい時間帯（例: `21,22` など）に挙手してください！"
-            )
+    embed = discord.Embed(
+        title="MKUC 本日の挙手状況",
+        description=(
+            "チームごとの挙手状況です。\n"
+            "個人名は表示されません。"
+        ),
+        color=discord.Color.blue(),
+        timestamp=now_jst(),
+    )
 
-# --- 翌朝8:00の自動クリア ---
-@tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=datetime.timezone(datetime.timedelta(hours=9))))
-async def daily_clear():
-    today = get_today_str()
-    if today in gestures:
-        gestures[today] = {}
-    print("朝8:00になったため、本日の挙手データをリセットしました。")
+    for slot in TIME_SLOTS:
+        rows = db.execute(
+            """
+            SELECT role_id
+            FROM gestures
+            WHERE guild_id=? AND date=? AND slot=?
+            ORDER BY role_id
+            """,
+            (guild.id, today, slot),
+        ).fetchall()
 
-# --- マッチング自動処理ループ（毎分チェック: 20:53, 21:53, 22:53） ---
-@tasks.loop(minutes=1)
-async def matching_check_loop():
-    now_jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
-    current_time_str = now_jst.strftime("%H:%M")
-    today = get_today_str()
+        role_ids = [row[0] for row in rows]
 
-    # 締め切り時刻の判定マップ（各試合時間の7分前）
-    # 21時試合 -> 20:53締切
-    # 22時試合 -> 21:53締切
-    # 23時試合 -> 22:53締切
-    deadline_map = {
-        "20:53": "21",
-        "21:53": "22",
-        "22:53": "23"
-    }
+        # 締切時刻を過ぎた時間帯には締切済みと表示
+        current_time = now_jst().time()
 
-    if current_time_str in deadline_map:
-        slot = deadline_map[current_time_str]
-        if today in gestures and slot in gestures[today] and gestures[today][slot]:
-            await execute_matching(slot)
-
-async def execute_matching(slot: str):
-    today = get_today_str()
-    teams = list(gestures[today][slot]) # 挙手したチームのrole_idリスト
-    
-    for guild in bot.guilds:
-        # 該当チャンネル（例: "募集-挙手" や最初のチャンネル）を探す
-        channel = discord.utils.get(guild.text_channels, name="募集-挙手")
-        if not channel:
-            channel = guild.text_channels[0]
-
-        await channel.send(f"🔒 【{slot}時枠】の挙手を締め切りました！マッチングを実行します...")
-
-        import random
-        random.shuffle(teams)
-
-        # 漏れるチームがある場合（奇数など）の処理
-        odd_team = None
-        if len(teams) % 2 != 0:
-            prioritize_2000 = (get_setting("prioritize_2000") == "true")
-            if prioritize_2000:
-                # 2000点超えているチームを優先して漏れさせる（お休み）
-                over_2000_teams = [t for t in teams if get_team_points(t) >= 2000]
-                if over_2000_teams:
-                    odd_team = random.choice(over_2000_teams)
-                else:
-                    odd_team = teams[-1]
-            else:
-                odd_team = teams[-1]
-            teams.remove(odd_team)
-            role_obj = guild.get_role(odd_team)
-            role_name = role_obj.name if role_obj else "不明"
-            await channel.send(f"⚠️ チーム数が奇数のため、今回のマッチングから外れる（お休みとなる）チーム：**{role_name}**")
-
-        # ペアを作成してチャンネル作成
-        pairs = [(teams[i], teams[i+1]) for i in range(0, len(teams), 2)]
-        
-        date_tag = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%m%d")
-
-        for idx, (team1_id, team2_id) in enumerate(pairs, start=1):
-            t1_role = guild.get_role(team1_id)
-            t2_role = guild.get_role(team2_id)
-            t1_name = t1_role.name if t1_role else "Team1"
-            t2_name = t2_role.name if t2_role else "Team2"
-
-            room_name = f"{date_tag}-{slot}-room{idx}"
-
-            # チャンネルの権限設定（両チームのロールと運営以外は見れないようにする）
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(read_messages=False),
-                t1_role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-                t2_role: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-                guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-            }
-
-            # カテゴリーがあればそこに作る、なければそのまま
-            room_channel = await guild.create_text_channel(room_name, overwrites=overwrites)
-
-            # ホストをランダムで決定
-            host_role = random.choice([t1_role, t2_role])
-
-            # メンションとホスト通知
-            await room_channel.send(
-                f"{t1_role.mention} {t2_role.mention}\n"
-                f"部屋が作成されました！試合を行ってください。\n"
-                f"🏠 **Host:** {host_role.mention}"
-            )
-
-        # 処理が終わったらその時間枠の挙手をクリア
-        gestures[today][slot] = []
-
-
-# --- スラッシュコマンドの実装 ---
-
-# 1. 挙手コマンド: /c-uc times:21,22 など
-@bot.tree.command(name="c-uc", description="指定した時間帯に挙手します（例: 21,22 または 21-23）")
-@app_commands.describe(times="挙手する時間帯（例: 21,22 または 21-23、23 など）")
-async def c_uc(interaction: discord.Interaction, times: str):
-    await interaction.response.defer(ephemeral=True)
-    
-    # ユーザーが持っているロールの中から、チームロール（サーバー内の他のロール、ここではメンバー全員が属するチームロールと仮定）を特定
-    # ※ユーザーのロールのうち、@everyoneやBot自身を除いたロールをチームロールとするか、
-    # あるいはユーザーが所属するロールを自動判定します。
-    member_roles = [role.id for role in interaction.user.roles if not role.is_default() and not role.managed]
-    
-    if not member_roles:
-        await interaction.followup.send("エラー: あなたにチームロールが割り当てられていません。", ephemeral=True)
-        return
-
-    # ユーザーの最初のチームロールを代表ロールとする（あるいは複数ある場合はすべて対応）
-    # ここでは仕様に沿って「そのチームのロール」として処理します
-    team_role_id = member_roles[0] # 本人のメインチームロール
-
-    # 入力された時間（例: "21,22" や "21-23"）を解析
-    time_slots = []
-    try:
-        if "-" in times:
-            start, end = map(int, times.split("-"))
-            time_slots = [str(h) for h in range(start, end + 1)]
-        elif "," in times:
-            time_slots = [t.strip() for t in times.split(",")]
+        if current_time >= DEADLINES[slot]:
+            status = "受付終了"
         else:
-            time_slots = [times.strip()]
-    except Exception:
-        await interaction.followup.send("エラー: 時間の指定形式が正しくありません。（例: `21,22` または `21-23`）", ephemeral=True)
-        return
+            status = "受付中"
 
-    today = get_today_str()
-    if today not in gestures:
-        gestures[today] = {}
+        if role_ids:
+            team_lines = []
 
-    registered_slots = []
-    for slot in time_slots:
-        if slot not in ["21", "22", "23"]:
-            continue
-        if slot not in gestures[today]:
-            gestures[today][slot] = []
-        if team_role_id not in gestures[today][slot]:
-            gestures[today][slot].append(team_role_id)
-        registered_slots.append(slot)
+            for role_id in role_ids:
+                role = guild.get_role(role_id)
 
-    role_obj = interaction.guild.get_role(team_role_id)
-    team_name = role_obj.name if role_obj else "あなたのチーム"
+                if role is not None:
+                    team_lines.append(role.mention)
 
-    await interaction.followup.send(f"✅ チーム「{team_name}」の {', '.join(registered_slots)}時枠 の挙手を登録しました！", ephemeral=True)
-    await send_gesture_status(interaction.channel)
+            team_text = "\n".join(team_lines) if team_lines else "なし"
+        else:
+            team_text = "なし"
 
+        embed.add_field(
+            name=f"{slot}時枠（{status}）・{len(role_ids)}チーム",
+            value=team_text,
+            inline=False,
+        )
 
-# 2. 挙手を下ろすコマンド: /d-uc time:22
-@bot.tree.command(name="d-uc", description="指定した時間帯の挙手を下ろします")
-@app_commands.describe(time_slot="取り下げる時間帯（例: 22）")
-@app_commands.choices(time_slot=[
-    app_commands.Choice(name="21時", value="21"),
-    app_commands.Choice(name="22時", value="22"),
-    app_commands.Choice(name="23時", value="23"),
-])
-async def d_uc(interaction: discord.Interaction, time_slot: str):
-    await interaction.response.defer(ephemeral=True)
-    member_roles = [role.id for role in interaction.user.roles if not role.is_default() and not role.managed]
-    if not member_roles:
-        await interaction.followup.send("エラー: チームロールが見つかりません。", ephemeral=True)
-        return
-    team_role_id = member_roles[0]
+    embed.set_footer(text="MKUC 2026 | 挙手状況")
 
-    today = get_today_str()
-    if today in gestures and time_slot in gestures[today]:
-        if team_role_id in gestures[today][time_slot]:
-            gestures[today][time_slot].remove(team_role_id)
-
-    await interaction.followup.send(f"🗑️ {time_slot}時枠の挙手を取り下げました。", ephemeral=True)
-    await send_gesture_status(interaction.channel)
+    try:
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException:
+        log.exception("挙手一覧の投稿に失敗しました")
 
 
-# 3. 挙手完全クリア: /clear-uc
-@bot.tree.command(name="clear-uc", description="本日の挙手を完全にクリアします（運営用）")
-async def clear_uc(interaction: discord.Interaction):
-    today = get_today_str()
-    gestures[today] = {}
-    await interaction.response.send_message("🧹 本日の挙手をすべてクリアしました。", ephemeral=True)
-    await send_gesture_status(interaction.channel)
+# ============================================================
+# チームの挙手
+# ============================================================
+
+def parse_times(times):
+    times = times.strip().replace(" ", "")
+
+    if not times:
+        raise ValueError("時間を指定してください。")
+
+    if "-" in times:
+        parts = times.split("-")
+
+        if len(parts) != 2:
+            raise ValueError("時間の指定形式が正しくありません。")
+
+        start, end = map(int, parts)
+
+        if start > end:
+            raise ValueError("時間の範囲が正しくありません。")
+
+        slots = [str(h) for h in range(start, end + 1)]
+
+    else:
+        slots = [part for part in times.split(",") if part]
+
+    if not slots:
+        raise ValueError("時間を指定してください。")
+
+    if any(slot not in TIME_SLOTS for slot in slots):
+        raise ValueError(
+            "指定できる時間は21、22、23です。"
+            "例: `21,22`、`21-23`、`23`"
+        )
+
+    # 重複を除去
+    return list(dict.fromkeys(slots))
 
 
-# 4. スコア加算コマンド: /score-uc @チームA 491 @チームB 493
-@bot.tree.command(name="score-uc", description="試合結果のスコアを各チームに加算します（運営用）")
+@bot.tree.command(
+    name="c-uc",
+    description="参加可能な時間帯に挙手します",
+)
 @app_commands.describe(
-    team1="チーム1のロール", points1="チーム1の獲得ポイント",
-    team2="チーム2のロール", points2="チーム2の獲得ポイント",
-    team3="チーム3のロール（任意の3チーム目があれば）", points3="チーム3のポイント",
-    team4="チーム4のロール（任意）", points4="チーム4のポイント"
+    times="例: 21,22 または 21-23 または 23"
+)
+async def c_uc(
+    interaction: discord.Interaction,
+    times: str,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "このコマンドはサーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    team_role, error = get_team_role_from_interaction(interaction)
+
+    if error:
+        await interaction.response.send_message(
+            error,
+            ephemeral=True,
+        )
+        return
+
+    try:
+        slots = parse_times(times)
+    except ValueError as exc:
+        await interaction.response.send_message(
+            str(exc),
+            ephemeral=True,
+        )
+        return
+
+    today = today_str()
+    current = now_jst().time()
+
+    registered = []
+    rejected = []
+
+    for slot in slots:
+        # その時間帯だけを判定する
+        # 21時の締切後でも22時・23時には挙手できる
+        if current >= DEADLINES[slot]:
+            rejected.append(slot)
+            continue
+
+        db_execute(
+            """
+            INSERT OR IGNORE INTO gestures (
+                guild_id,
+                date,
+                slot,
+                role_id
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                interaction.guild.id,
+                today,
+                slot,
+                team_role.id,
+            ),
+        )
+
+        registered.append(slot)
+
+    if registered:
+        await refresh_gesture_status(interaction.guild)
+
+    messages = []
+
+    if registered:
+        messages.append(
+            f"✅ {team_role.name} の挙手を登録しました。\n"
+            f"時間帯: {', '.join(registered)}時"
+        )
+
+    if rejected:
+        messages.append(
+            f"⚠️ 以下の時間帯は締切済みです: "
+            f"{', '.join(rejected)}時"
+        )
+
+    if not messages:
+        messages.append("挙手内容に変更はありません。")
+
+    await interaction.response.send_message(
+        "\n\n".join(messages),
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# 挙手取り下げ
+# ============================================================
+
+@bot.tree.command(
+    name="d-uc",
+    description="指定した時間帯の挙手を取り下げます",
+)
+@app_commands.describe(
+    time_slot="取り下げる時間帯"
+)
+@app_commands.choices(
+    time_slot=[
+        app_commands.Choice(name="21時", value="21"),
+        app_commands.Choice(name="22時", value="22"),
+        app_commands.Choice(name="23時", value="23"),
+    ]
+)
+async def d_uc(
+    interaction: discord.Interaction,
+    time_slot: app_commands.Choice[str],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    team_role, error = get_team_role_from_interaction(interaction)
+
+    if error:
+        await interaction.response.send_message(
+            error,
+            ephemeral=True,
+        )
+        return
+
+    slot = time_slot.value
+
+    # 締切後は取り下げ不可
+    if now_jst().time() >= DEADLINES[slot]:
+        await interaction.response.send_message(
+            "この時間帯はすでに締切済みです。",
+            ephemeral=True,
+        )
+        return
+
+    db_execute(
+        """
+        DELETE FROM gestures
+        WHERE guild_id=? AND date=? AND slot=? AND role_id=?
+        """,
+        (
+            interaction.guild.id,
+            today_str(),
+            slot,
+            team_role.id,
+        ),
+    )
+
+    await refresh_gesture_status(interaction.guild)
+
+    await interaction.response.send_message(
+        f"🗑️ {team_role.name} の {slot}時枠の挙手を取り下げました。",
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# 運営設定
+# ============================================================
+
+@bot.tree.command(
+    name="setup-uc",
+    description="MKUC Botの使用チャンネルなどを設定します",
+)
+@app_commands.describe(
+    signup_channel="挙手一覧を投稿するテキストチャンネル",
+    participant_role="募集開始時にメンションする参加者ロール",
+    room_category="対戦部屋を作成するカテゴリ",
+)
+async def setup_uc(
+    interaction: discord.Interaction,
+    signup_channel: discord.TextChannel,
+    participant_role: discord.Role,
+    room_category: discord.CategoryChannel = None,
+):
+    if not await require_admin(interaction):
+        return
+
+    set_config(
+        interaction.guild.id,
+        signup_channel.id,
+        participant_role.id,
+        room_category.id if room_category else None,
+    )
+
+    await interaction.response.send_message(
+        "✅ MKUC Botの設定を保存しました。\n"
+        f"挙手チャンネル: {signup_channel.mention}\n"
+        f"参加者ロール: {participant_role.mention}\n"
+        f"対戦部屋カテゴリ: "
+        f"{room_category.name if room_category else '未指定'}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="teamrole-uc",
+    description="チームロールを登録・解除します",
+)
+@app_commands.describe(
+    action="登録または解除",
+    role="対象のチームロール",
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="登録", value="add"),
+        app_commands.Choice(name="解除", value="remove"),
+    ]
+)
+async def teamrole_uc(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    role: discord.Role,
+):
+    if not await require_admin(interaction):
+        return
+
+    if action.value == "add":
+        register_team_role(interaction.guild.id, role.id)
+
+        await interaction.response.send_message(
+            f"✅ チームロール {role.mention} を登録しました。",
+            ephemeral=True,
+        )
+
+    else:
+        unregister_team_role(interaction.guild.id, role.id)
+
+        await interaction.response.send_message(
+            f"🗑️ チームロール {role.mention} の登録を解除しました。",
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# 得点管理
+# ============================================================
+
+@bot.tree.command(
+    name="score-uc",
+    description="2チームのポイントを加算します",
+)
+@app_commands.describe(
+    team1="1チーム目のロール",
+    points1="1チーム目の加算ポイント",
+    team2="2チーム目のロール",
+    points2="2チーム目の加算ポイント",
 )
 async def score_uc(
     interaction: discord.Interaction,
-    team1: discord.Role, points1: int,
-    team2: discord.Role, points2: int,
-    team3: discord.Role = None, points3: int = 0,
-    team4: discord.Role = None, points4: int = 0
+    team1: discord.Role,
+    points1: int,
+    team2: discord.Role,
+    points2: int,
 ):
-    add_team_points(team1.id, points1)
-    add_team_points(team2.id, points2)
-    if team3 and points3:
-        add_team_points(team3.id, points3)
-    if team4 and points4:
-        add_team_points(team4.id, points4)
+    if not await require_admin(interaction):
+        return
+
+    registered = get_team_role_ids(interaction.guild.id)
+
+    if team1.id not in registered or team2.id not in registered:
+        await interaction.response.send_message(
+            "指定したロールのいずれかがチームロールとして登録されていません。",
+            ephemeral=True,
+        )
+        return
+
+    if points1 < 0 or points2 < 0:
+        await interaction.response.send_message(
+            "加算ポイントは0以上を指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    total1 = add_points(
+        interaction.guild.id,
+        team1.id,
+        points1,
+    )
+
+    total2 = add_points(
+        interaction.guild.id,
+        team2.id,
+        points2,
+    )
 
     await interaction.response.send_message(
-        f"📊 スコアを記録・加算しました！\n"
-        f"・ {team1.name}: +{points1}pt (累計: {get_team_points(team1.id)}pt)\n"
-        f"・ {team2.name}: +{points2}pt (累計: {get_team_points(team2.id)}pt)"
-        + (f"\n・ {team3.name}: +{points3}pt" if team3 else "")
-        + (f"\n・ {team4.name}: +{points4}pt" if team4 else "")
+        f"📊 スコアを加算しました。\n\n"
+        f"**{team1.name}**: +{points1}pt → 累計 **{total1}pt**\n"
+        f"**{team2.name}**: +{points2}pt → 累計 **{total2}pt**",
+        ephemeral=True,
     )
 
 
-# 5. スコア直接変更コマンド: /scorechange-uc @チーム 2980
-@bot.tree.command(name="scorechange-uc", description="チームの総得点を直接書き換えます（運営用バグ修正用）")
-@app_commands.describe(team="対象のチームロール", points="変更後の総得点")
-async def scorechange_uc(interaction: discord.Interaction, team: discord.Role, points: int):
-    set_team_points(team.id, points)
+@bot.tree.command(
+    name="scorechange-uc",
+    description="チームの累計ポイントを直接変更します",
+)
+@app_commands.describe(
+    team="対象のチームロール",
+    points="変更後の累計ポイント",
+)
+async def scorechange_uc(
+    interaction: discord.Interaction,
+    team: discord.Role,
+    points: int,
+):
+    if not await require_admin(interaction):
+        return
+
+    if team.id not in get_team_role_ids(interaction.guild.id):
+        await interaction.response.send_message(
+            "このロールはチームロールとして登録されていません。",
+            ephemeral=True,
+        )
+        return
+
+    if points < 0:
+        await interaction.response.send_message(
+            "ポイントは0以上を指定してください。",
+            ephemeral=True,
+        )
+        return
+
+    set_points(
+        interaction.guild.id,
+        team.id,
+        points,
+    )
+
     await interaction.response.send_message(
-        f"✏️ チーム「{team.name}」の総得点を **{points}pt** に直接書き換えました。", ephemeral=True
+        f"✏️ {team.name} の累計ポイントを **{points}pt** に変更しました。",
+        ephemeral=True,
     )
 
 
-# 6. お休み優先機能の切り替え: /toggle-prioritize
-@bot.tree.command(name="toggle-prioritize", description="2000点超えチーム優先お休み機能のON/OFFを切り替えます（運営用）")
-@app_commands.choices(status=[
-    app_commands.Choice(name="ON (有効)", value="true"),
-    app_commands.Choice(name="OFF (無効)", value="false")
-])
-async def toggle_prioritize(interaction: discord.Interaction, status: str):
-    set_setting("prioritize_2000", status)
-    await interaction.response.send_message(
-        f"⚙️ 2000点超えチーム優先お休み機能を **{status.upper()}** に設定しました。", ephemeral=True
+@bot.tree.command(
+    name="toggle-prioritize-uc",
+    description="2000点超えチーム優先お休み機能を切り替えます",
+)
+@app_commands.describe(
+    enabled="機能を有効にするかどうか",
+)
+async def toggle_prioritize_uc(
+    interaction: discord.Interaction,
+    enabled: bool,
+):
+    if not await require_admin(interaction):
+        return
+
+    set_setting(
+        interaction.guild.id,
+        "prioritize_2000",
+        "true" if enabled else "false",
     )
 
+    await interaction.response.send_message(
+        "⚙️ 2000点超えチーム優先お休み機能を "
+        f"**{'ON' if enabled else 'OFF'}** に設定しました。",
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# 挙手の手動クリア
+# ============================================================
+
+@bot.tree.command(
+    name="clear-uc",
+    description="本日の挙手をすべて削除します",
+)
+async def clear_uc(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    db_execute(
+        """
+        DELETE FROM gestures
+        WHERE guild_id=? AND date=?
+        """,
+        (interaction.guild.id, today_str()),
+    )
+
+    await refresh_gesture_status(interaction.guild)
+
+    await interaction.response.send_message(
+        "🧹 本日の挙手をすべて削除しました。",
+        ephemeral=True,
+    )
+
+
+# ============================================================
+# マッチング
+# ============================================================
+
+def has_played_recently(guild_id, team1_id, team2_id, days=2):
+    cutoff = (
+        now_jst().date()
+        - datetime.timedelta(days=days)
+    ).isoformat()
+
+    a, b = sorted([team1_id, team2_id])
+
+    row = db.execute(
+        """
+        SELECT COUNT(*)
+        FROM match_history
+        WHERE guild_id=?
+          AND date>=?
+          AND (
+            (team1_id=? AND team2_id=?)
+            OR
+            (team1_id=? AND team2_id=?)
+          )
+        """,
+        (
+            guild_id,
+            cutoff,
+            a, b,
+            b, a,
+        ),
+    ).fetchone()
+
+    return row[0] > 0
+
+
+def choose_resting_team(guild_id, teams):
+    """
+    奇数の場合、休みになるチームを選ぶ。
+    2000点超え優先機能がONなら、該当チームから選ぶ。
+    """
+
+    prioritize = (
+        get_setting(guild_id, "prioritize_2000", "true")
+        == "true"
+    )
+
+    if prioritize:
+        over_2000 = [
+            team_id
+            for team_id in teams
+            if get_points(guild_id, team_id) > 2000
+        ]
+
+        if over_2000:
+            return random.choice(over_2000)
+
+    return random.choice(teams)
+
+
+def make_pairs(guild_id, teams):
+    """
+    同じチームとの連続対戦を避けるようにペアを作る。
+
+    完全最適化ではなく、ランダム性を残しつつ
+    最近対戦したチームとの組み合わせを避ける方式。
+    """
+
+    remaining = list(teams)
+    random.shuffle(remaining)
+
+    pairs = []
+
+    while len(remaining) >= 2:
+        team1 = remaining.pop(0)
+
+        candidates = list(remaining)
+        random.shuffle(candidates)
+
+        # 最近対戦していないチームを優先
+        opponents = [
+            team
+            for team in candidates
+            if not has_played_recently(
+                guild_id,
+                team1,
+                team,
+            )
+        ]
+
+        if opponents:
+            team2 = opponents[0]
+        else:
+            team2 = candidates[0]
+
+        remaining.remove(team2)
+
+        pairs.append((team1, team2))
+
+    return pairs
+
+
+async def execute_matching(guild, slot, date_str):
+    """
+    マッチングをDBに保存する。
+    保存後に再実行されても二重作成しない。
+    """
+
+    existing = db.execute(
+        """
+        SELECT matched
+        FROM daily_status
+        WHERE guild_id=? AND date=? AND slot=?
+        """,
+        (guild.id, date_str, slot),
+    ).fetchone()
+
+    if existing and existing[0] == 1:
+        return
+
+    teams = [
+        row[0]
+        for row in db.execute(
+            """
+            SELECT role_id
+            FROM gestures
+            WHERE guild_id=? AND date=? AND slot=?
+            ORDER BY role_id
+            """,
+            (guild.id, date_str, slot),
+        ).fetchall()
+    ]
+
+    # まず処理済み状態を保存
+    db_execute(
+        """
+        INSERT INTO daily_status (
+            guild_id, date, slot, matched, rooms_created
+        )
+        VALUES (?, ?, ?, 1, 0)
+        ON CONFLICT(guild_id, date, slot)
+        DO UPDATE SET matched=1
+        """,
+        (guild.id, date_str, slot),
+    )
+
+    config = get_config(guild.id)
+
+    if not config:
+        log.error("サーバー設定がありません: %s", guild.id)
+        return
+
+    channel = await get_text_channel(
+        guild,
+        config["signup_channel_id"],
+    )
+
+    if channel is None:
+        return
+
+    # チームが0の場合
+    if len(teams) == 0:
+        await channel.send(
+            f"⚠️ {slot}時枠: 挙手チームがありませんでした。"
+        )
+        return
+
+    resting = None
+
+    # 奇数なら1チームを休みにする
+    if len(teams) % 2 == 1:
+        resting = choose_resting_team(guild.id, teams)
+        teams.remove(resting)
+
+    pairs = make_pairs(guild.id, teams)
+
+    # マッチング結果を保存
+    for idx, (team1, team2) in enumerate(pairs, start=1):
+        host = random.choice([team1, team2])
+
+        db_execute(
+            """
+            INSERT OR IGNORE INTO matches (
+                guild_id,
+                date,
+                slot,
+                room_number,
+                team1_id,
+                team2_id,
+                host_id,
+                channel_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                guild.id,
+                date_str,
+                slot,
+                idx,
+                team1,
+                team2,
+                host,
+            ),
+        )
+
+        a, b = sorted([team1, team2])
+
+        db_execute(
+            """
+            INSERT INTO match_history (
+                guild_id,
+                date,
+                slot,
+                team1_id,
+                team2_id
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                guild.id,
+                date_str,
+                slot,
+                a,
+                b,
+            ),
+        )
+
+    lines = [
+        f"🔒 **{slot}時枠のマッチング結果**",
+    ]
+
+    if resting is not None:
+        role = guild.get_role(resting)
+        name = role.mention if role else f"不明なロール ({resting})"
+
+        lines.append(
+            f"💤 今回のお休み: {name}"
+        )
+
+    if not pairs:
+        lines.append("対戦カードはありません。")
+
+    for idx, (team1, team2) in enumerate(pairs, start=1):
+        r1 = guild.get_role(team1)
+        r2 = guild.get_role(team2)
+
+        n1 = r1.mention if r1 else str(team1)
+        n2 = r2.mention if r2 else str(team2)
+
+        lines.append(
+            f"Room {idx}: {n1} vs {n2}"
+        )
+
+    await channel.send(
+        "\n".join(lines),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+# ============================================================
+# 対戦部屋作成
+# ============================================================
+
+async def create_match_rooms(guild, slot, date_str):
+    status = db.execute(
+        """
+        SELECT matched, rooms_created
+        FROM daily_status
+        WHERE guild_id=? AND date=? AND slot=?
+        """,
+        (guild.id, date_str, slot),
+    ).fetchone()
+
+    # マッチングが完了していなければ部屋は作らない
+    if not status or status[0] != 1:
+        return
+
+    # すでに部屋作成済み
+    if status[1] == 1:
+        return
+
+    config = get_config(guild.id)
+
+    if not config:
+        return
+
+    category = None
+
+    if config["room_category_id"]:
+        category = guild.get_channel(
+            config["room_category_id"]
+        )
+
+    matches = db.execute(
+        """
+        SELECT id, room_number, team1_id, team2_id, host_id, channel_id
+        FROM matches
+        WHERE guild_id=? AND date=? AND slot=?
+        ORDER BY room_number
+        """,
+        (guild.id, date_str, slot),
+    ).fetchall()
+
+    if not matches:
+        db_execute(
+            """
+            UPDATE daily_status
+            SET rooms_created=1
+            WHERE guild_id=? AND date=? AND slot=?
+            """,
+            (guild.id, date_str, slot),
+        )
+        return
+
+    team_role_ids = get_team_role_ids(guild.id)
+
+    # @everyone以外のロールからも、明示的に閲覧権限を外す
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False,
+        )
+    }
+
+    for role in guild.roles:
+        if role.is_default():
+            continue
+
+        if role.id in team_role_ids:
+            continue
+
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=False,
+        )
+
+    # Bot本人には閲覧・投稿権限を付与
+    overwrites[guild.me] = discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        manage_channels=True,
+    )
+
+    failed = False
+
+    for match_id, room_number, team1_id, team2_id, host_id, saved_channel_id in matches:
+        # Bot再起動前に作成済みなら、そのチャンネルを再利用
+        if saved_channel_id:
+            existing_channel = guild.get_channel(saved_channel_id)
+
+            if existing_channel is not None:
+                continue
+
+        team1_role = guild.get_role(team1_id)
+        team2_role = guild.get_role(team2_id)
+        host_role = guild.get_role(host_id)
+
+        if not team1_role or not team2_role or not host_role:
+            log.error("チームロールが見つかりません")
+            failed = True
+            continue
+
+        # 対戦する2チームのみ閲覧・投稿可能
+        room_overwrites = dict(overwrites)
+
+        room_overwrites[team1_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+        )
+
+        room_overwrites[team2_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+        )
+
+        date_tag = date_str.replace("-", "")
+        room_name = f"{date_tag}-{slot}-room{room_number}"
+
+        try:
+            room = await guild.create_text_channel(
+                room_name,
+                category=category,
+                overwrites=room_overwrites,
+                reason="MKUC 2026 自動マッチング",
+            )
+
+            db_execute(
+                """
+                UPDATE matches
+                SET channel_id=?
+                WHERE id=?
+                """,
+                (room.id, match_id),
+            )
+
+            await room.send(
+                f"{team1_role.mention} {team2_role.mention}\n\n"
+                f"🏁 **MKUC 2026 対戦部屋**\n"
+                f"時間帯: **{slot}時**\n"
+                f"Room: **{room_number}**\n\n"
+                f"🏠 **Host:** {host_role.mention}\n\n"
+                "両チームで連絡を取り、交流戦を開始してください。",
+                allowed_mentions=discord.AllowedMentions(
+                    roles=True,
+                ),
+            )
+
+        except discord.HTTPException:
+            log.exception("対戦部屋の作成に失敗しました")
+            failed = True
+
+    if not failed:
+        db_execute(
+            """
+            UPDATE daily_status
+            SET rooms_created=1
+            WHERE guild_id=? AND date=? AND slot=?
+            """,
+            (guild.id, date_str, slot),
+        )
+
+
+# ============================================================
+# 自動募集
+# ============================================================
+
+async def send_daily_announcement(guild):
+    config = get_config(guild.id)
+
+    if not config:
+        return
+
+    channel = await get_text_channel(
+        guild,
+        config["signup_channel_id"],
+    )
+
+    if channel is None:
+        return
+
+    role_id = config["participant_role_id"]
+    participant_role = guild.get_role(role_id)
+
+    if participant_role is None:
+        await channel.send(
+            "⚠️ 参加者ロールが見つかりません。"
+            "運営は `/setup-uc` で設定を確認してください。"
+        )
+        return
+
+    await channel.send(
+        f"{participant_role.mention}\n\n"
+        "📢 **12時になりましたので、本日の募集を開始します！**\n\n"
+        "参加できる時間帯に、以下のコマンドで挙手してください。\n"
+        "`/c-uc times:21,22`\n"
+        "`/c-uc times:21-23`\n"
+        "`/c-uc times:23`\n\n"
+        "挙手を取り下げる場合は `/d-uc` を使用してください。",
+        allowed_mentions=discord.AllowedMentions(
+            roles=True,
+        ),
+    )
+
+
+# ============================================================
+# 定期処理
+# ============================================================
+
+@tasks.loop(seconds=10)
+async def scheduler():
+    current = now_jst()
+    date_str = current.strftime("%Y-%m-%d")
+    current_time = current.time()
+
+    for guild in bot.guilds:
+        config = get_config(guild.id)
+
+        if not config:
+            continue
+
+        # 12時の募集開始
+        if current.hour == 12 and current.minute == 0:
+            key = f"announcement_{date_str}"
+
+            if get_setting(guild.id, key, "false") != "true":
+                await send_daily_announcement(guild)
+                set_setting(guild.id, key, "true")
+
+        # 翌朝8時の挙手クリア
+        if current.hour == 8 and current.minute == 0:
+            key = f"clear_{date_str}"
+
+            if get_setting(guild.id, key, "false") != "true":
+                yesterday = (
+                    current.date() - datetime.timedelta(days=1)
+                ).isoformat()
+
+                db_execute(
+                    """
+                    DELETE FROM gestures
+                    WHERE guild_id=? AND date=?
+                    """,
+                    (guild.id, yesterday),
+                )
+
+                set_setting(guild.id, key, "true")
+
+                await refresh_gesture_status(guild)
+
+        # 時間帯ごとの締切・マッチング・部屋作成
+        for slot in TIME_SLOTS:
+            deadline = DEADLINES[slot]
+            match_time = MATCH_TIMES[slot]
+            room_time = ROOM_TIMES[slot]
+
+            # 締切後に挙手一覧を更新
+            if (
+                current.hour == deadline.hour
+                and current.minute == deadline.minute
+                and current.second < 10
+            ):
+                key = f"deadline_{date_str}_{slot}"
+
+                if get_setting(guild.id, key, "false") != "true":
+                    await refresh_gesture_status(guild)
+                    set_setting(guild.id, key, "true")
+
+            # マッチング
+            if current_time >= match_time:
+                await execute_matching(
+                    guild,
+                    slot,
+                    date_str,
+                )
+
+            # 部屋作成
+            if current_time >= room_time:
+                await create_match_rooms(
+                    guild,
+                    slot,
+                    date_str,
+                )
+
+
+@scheduler.before_loop
+async def before_scheduler():
+    await bot.wait_until_ready()
+
+
+# ============================================================
+# ヘルスチェック用Webサーバー
+# ============================================================
+
+async def handle_health(request):
+    return web.Response(
+        text="MKUC 2026 Bot is running!",
+    )
+
+
+async def start_web_server():
+    app = web.Application()
+
+    app.add_routes([
+        web.get("/", handle_health),
+        web.get("/health", handle_health),
+    ])
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT,
+    )
+
+    await site.start()
+
+    log.info("Web server started on port %s", PORT)
+
+
+# ============================================================
+# 起動
+# ============================================================
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user.name} (ID: {bot.user.id})")
-    daily_announcement.start()
-    daily_clear.start()
-    matching_check_loop.start()
+    log.info(
+        "Logged in as %s (%s)",
+        bot.user,
+        bot.user.id,
+    )
+
+    if not scheduler.is_running():
+        scheduler.start()
+
+
+@bot.event
+async def setup_hook():
+    pass
+
+
+async def main():
+    if not TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN が設定されていません。"
+        )
+
+    await bot.login(TOKEN)
+
+    # コマンドを同期
+    await bot.tree.sync()
+
+    # WebサーバーとBotを起動
     await start_web_server()
 
-# Botの起動
+    try:
+        await bot.connect()
+    finally:
+        await bot.close()
+
+
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    asyncio.run(main())
