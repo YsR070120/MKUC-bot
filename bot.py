@@ -434,7 +434,9 @@ async def refresh_gesture_status(guild):
         # 締切時刻を過ぎた時間帯には締切済みと表示
         current_time = now_jst().time()
 
-        if current_time >= DEADLINES[slot]:
+        now_time = now_jst().time()
+        deadline_time = DEADLINES[slot]
+        if (now_time.hour, now_time.minute) >= (deadline_time.hour, deadline_time.minute):
             status = "受付終了"
         else:
             status = "受付中"
