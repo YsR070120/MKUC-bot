@@ -1040,11 +1040,11 @@ async def setup_uc(
 
 @bot.tree.command(
     name="teamrole-uc",
-    description="チームロールを登録・解除します",
+    description="チームロールを一括登録・解除します",
 )
 @app_commands.describe(
     action="登録または解除",
-    role="チームロール",
+    roles="対象のチームロール。複数指定できます",
 )
 @app_commands.choices(
     action=[
@@ -1055,34 +1055,157 @@ async def setup_uc(
 async def teamrole_uc(
     interaction: discord.Interaction,
     action: app_commands.Choice[str],
-    role: discord.Role,
+    roles: str,
 ):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
     if not await require_admin(interaction):
         return
 
-    if action.value == "add":
-        register_team_role(interaction.guild.id, role.id)
+    # ロールメンションからロールIDを取得する。
+    role_ids = re.findall(r"<@&(\d+)>", roles)
 
-        if not db.execute(
-            """
-            SELECT 1 FROM scores
-            WHERE guild_id=? AND role_id=?
-            """,
-            (interaction.guild.id, role.id),
-        ).fetchone():
-            set_team_score(interaction.guild.id, role.id, 0)
-
+    if not role_ids:
         await interaction.response.send_message(
-            f"✅ チームロール {role.mention} を登録しました。",
+            "❌ チームロールを1つ以上指定してください。\n"
+            "例：`/teamrole-uc action:登録 roles:@京都大学 @大阪大学`",
             ephemeral=True,
         )
-    else:
-        unregister_team_role(interaction.guild.id, role.id)
+        return
 
-        await interaction.response.send_message(
-            f"🗑️ チームロール {role.mention} の登録を解除しました。",
-            ephemeral=True,
+    # 同じロールが複数回指定されていても、1回だけ処理する。
+    role_ids = list(dict.fromkeys(map(int, role_ids)))
+
+    registered = []
+    already_registered = []
+    removed = []
+    not_registered = []
+    invalid = []
+
+    for role_id in role_ids:
+        role = interaction.guild.get_role(role_id)
+
+        if role is None:
+            invalid.append(f"削除済みロール（ID: {role_id}）")
+            continue
+
+        if action.value == "add":
+            existing = db.execute(
+                """
+                SELECT 1
+                FROM team_roles
+                WHERE guild_id=? AND role_id=?
+                """,
+                (interaction.guild.id, role_id),
+            ).fetchone()
+
+            if existing:
+                already_registered.append(role)
+                continue
+
+            register_team_role(
+                interaction.guild.id,
+                role_id,
+            )
+
+            # 得点データがなければ初期値0点で登録する。
+            if not db.execute(
+                """
+                SELECT 1
+                FROM scores
+                WHERE guild_id=? AND role_id=?
+                """,
+                (interaction.guild.id, role_id),
+            ).fetchone():
+                set_team_score(
+                    interaction.guild.id,
+                    role_id,
+                    0,
+                )
+
+            registered.append(role)
+
+        else:
+            existing = db.execute(
+                """
+                SELECT 1
+                FROM team_roles
+                WHERE guild_id=? AND role_id=?
+                """,
+                (interaction.guild.id, role_id),
+            ).fetchone()
+
+            if not existing:
+                not_registered.append(role)
+                continue
+
+            unregister_team_role(
+                interaction.guild.id,
+                role_id,
+            )
+
+            removed.append(role)
+
+    # 結果をまとめて表示する。
+    messages = []
+
+    if registered:
+        messages.append(
+            "✅ **登録しました**\n"
+            + "\n".join(
+                f"・{role.name}"
+                for role in registered
+            )
         )
+
+    if already_registered:
+        messages.append(
+            "ℹ️ **登録済みのため変更していません**\n"
+            + "\n".join(
+                f"・{role.name}"
+                for role in already_registered
+            )
+        )
+
+    if removed:
+        messages.append(
+            "🗑️ **登録を解除しました**\n"
+            + "\n".join(
+                f"・{role.name}"
+                for role in removed
+            )
+        )
+
+    if not_registered:
+        messages.append(
+            "ℹ️ **登録されていないため変更していません**\n"
+            + "\n".join(
+                f"・{role.name}"
+                for role in not_registered
+            )
+        )
+
+    if invalid:
+        messages.append(
+            "⚠️ **処理できなかったロール**\n"
+            + "\n".join(
+                f"・{name}"
+                for name in invalid
+            )
+        )
+
+    await interaction.response.send_message(
+        "\n\n".join(messages)
+        if messages
+        else "処理対象がありませんでした。",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(
