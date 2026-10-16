@@ -892,17 +892,12 @@ async def c_uc(interaction: discord.Interaction, times: str):
     name="d-uc",
     description="指定した時間帯の挙手を取り下げます",
 )
-@app_commands.describe(time_slot="取り下げる時間帯")
-@app_commands.choices(
-    time_slot=[
-        app_commands.Choice(name="21時", value="21"),
-        app_commands.Choice(name="22時", value="22"),
-        app_commands.Choice(name="23時", value="23"),
-    ],
+@app_commands.describe(
+    times="取り下げる時間帯。例：21、21,22、21-23",
 )
 async def d_uc(
     interaction: discord.Interaction,
-    time_slot: app_commands.Choice[str],
+    times: str,
 ):
     if interaction.guild is None:
         await interaction.response.send_message(
@@ -914,48 +909,89 @@ async def d_uc(
     team_role, error = get_team_role_from_interaction(interaction)
 
     if error:
-        await interaction.response.send_message(error, ephemeral=True)
+        await interaction.response.send_message(
+            error,
+            ephemeral=True,
+        )
         return
 
-    slot = time_slot.value
+    try:
+        slots = parse_times(times)
+    except ValueError as exc:
+        await interaction.response.send_message(
+            str(exc),
+            ephemeral=True,
+        )
+        return
+
     current = now_jst()
 
-    if is_slot_closed(slot, current):
+    if not signup_has_opened(current):
         await interaction.response.send_message(
-            "この時間帯はすでに締切済みです。",
+            "本日の挙手受付は12時に開始します。",
             ephemeral=True,
         )
         return
 
-    cursor = db_execute(
-        """
-        DELETE FROM gestures
-        WHERE guild_id=? AND date=? AND slot=? AND role_id=?
-        """,
-        (
-            interaction.guild.id,
-            current.strftime("%Y-%m-%d"),
-            slot,
-            team_role.id,
-        ),
-    )
+    today = current.strftime("%Y-%m-%d")
 
-    if not cursor.rowcount:
-        await interaction.response.send_message(
-            "この時間帯には挙手していません。",
-            ephemeral=True,
+    removed = []
+    not_registered = []
+    rejected = []
+
+    for slot in slots:
+        if is_slot_closed(slot, current):
+            rejected.append(slot)
+            continue
+
+        cursor = db_execute(
+            """
+            DELETE FROM gestures
+            WHERE guild_id=? AND date=? AND slot=? AND role_id=?
+            """,
+            (
+                interaction.guild.id,
+                today,
+                slot,
+                team_role.id,
+            ),
         )
-        return
+
+        if cursor.rowcount:
+            removed.append(slot)
+        else:
+            not_registered.append(slot)
+
+    messages = []
+
+    if removed:
+        messages.append(
+            f"🗑️ 挙手を取り下げました：{', '.join(removed)}時"
+        )
+
+    if not_registered:
+        messages.append(
+            f"ℹ️ 挙手していません：{', '.join(not_registered)}時"
+        )
+
+    if rejected:
+        messages.append(
+            f"⚠️ 締切済みのため取り下げできません："
+            f"{', '.join(rejected)}時"
+        )
 
     await interaction.response.send_message(
-        f"🗑️ {slot}時枠の挙手を取り下げました。",
+        "\n".join(messages)
+        if messages
+        else "取り下げできる時間帯がありませんでした。",
         ephemeral=True,
     )
 
-    await refresh_gesture_status(
-        interaction.guild,
-        interaction.channel,
-    )
+    if removed:
+        await refresh_gesture_status(
+            interaction.guild,
+            interaction.channel,
+        )
 
 
 # ============================================================
@@ -1074,6 +1110,90 @@ async def refresh_uc(interaction: discord.Interaction):
     await interaction.followup.send(
         "🔄 挙手一覧の更新処理を実行しました。",
         ephemeral=True,
+    )
+
+# ============================================================
+# 挙手チーム一覧（運営用）
+# ============================================================
+
+@bot.tree.command(
+    name="list-uc",
+    description="本日、挙手しているチームを時間帯ごとに確認します（運営用）",
+)
+async def list_uc(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    guild_id = guild.id
+    date = today_str()
+
+    embed = discord.Embed(
+        title="📋 MKUC 本日の挙手チーム一覧",
+        description=f"日付：{date}（日本時間）",
+        color=discord.Color.blue(),
+        timestamp=now_jst(),
+    )
+
+    total_teams = set()
+
+    for slot in TIME_SLOTS:
+        rows = db.execute(
+            """
+            SELECT role_id, created_at
+            FROM gestures
+            WHERE guild_id=? AND date=? AND slot=?
+            ORDER BY created_at ASC, role_id ASC
+            """,
+            (guild_id, date, slot),
+        ).fetchall()
+
+        team_names = []
+
+        for role_id, created_at in rows:
+            role = guild.get_role(role_id)
+
+            # ロールが削除されている場合
+            if role is None:
+                team_names.append(
+                    f"⚠️ 削除済みロール（ID: {role_id}）"
+                )
+                continue
+
+            # チームロール登録が解除されている場合も、
+            # 挙手データが残っていれば確認できるようにする。
+            team_names.append(role.mention)
+            total_teams.add(role_id)
+
+        if team_names:
+            value = "\n".join(
+                f"{index}. {name}"
+                for index, name in enumerate(team_names, start=1)
+            )
+        else:
+            value = "挙手しているチームはありません。"
+
+        embed.add_field(
+            name=f"🕒 {slot}時枠（{len(rows)}チーム）",
+            value=value,
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"挙手データがあるチーム数（重複除く）：{len(total_teams)}"
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
@@ -1276,10 +1396,15 @@ async def scorechange_uc(
 
 @bot.tree.command(
     name="scoreview-uc",
-    description="チームの登録得点を確認します",
+    description="チームの得点ランキング、または指定チームの得点を確認します",
 )
-@app_commands.describe(role="確認するチームロール")
-async def scoreview_uc(interaction: discord.Interaction, role: discord.Role):
+@app_commands.describe(
+    role="得点を確認するチームロール（省略するとランキングを表示）",
+)
+async def scoreview_uc(
+    interaction: discord.Interaction,
+    role: discord.Role = None,
+):
     if interaction.guild is None:
         await interaction.response.send_message(
             "サーバー内で使用してください。",
@@ -1287,14 +1412,103 @@ async def scoreview_uc(interaction: discord.Interaction, role: discord.Role):
         )
         return
 
-    if not await require_admin(interaction):
+    guild_id = interaction.guild.id
+    registered = get_team_role_ids(guild_id)
+
+    if not registered:
+        await interaction.response.send_message(
+            "チームロールがまだ登録されていません。",
+            ephemeral=True,
+        )
         return
 
-    points = get_team_score(interaction.guild.id, role.id)
+    # 特定のチームの得点を表示
+    if role is not None:
+        if role.id not in registered:
+            await interaction.response.send_message(
+                "このロールはチームロールとして登録されていません。",
+                ephemeral=True,
+            )
+            return
+
+        points = get_team_score(guild_id, role.id)
+
+        embed = discord.Embed(
+            title="🏆 チーム得点",
+            description=(
+                f"{role.mention}\n"
+                f"**{points:,}点**"
+            ),
+            color=discord.Color.gold(),
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    # 全チームの得点ランキングを表示
+    rows = db.execute(
+        """
+        SELECT role_id, points
+        FROM scores
+        WHERE guild_id=?
+        """,
+        (guild_id,),
+    ).fetchall()
+
+    score_map = {
+        role_id: points
+        for role_id, points in rows
+    }
+
+    ranking = []
+
+    for role_id in registered:
+        team_role = interaction.guild.get_role(role_id)
+
+        # 削除済みロールはスキップ
+        if team_role is None:
+            continue
+
+        points = score_map.get(role_id, 0)
+        ranking.append((team_role, points))
+
+    ranking.sort(
+        key=lambda item: (-item[1], item[0].name.lower())
+    )
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    lines = []
+
+    for index, (team_role, points) in enumerate(ranking, start=1):
+        if index <= 3:
+            rank_label = medals[index - 1]
+        else:
+            rank_label = f"**{index}位**"
+
+        lines.append(
+            f"{rank_label} {team_role.mention} — **{points:,}点**"
+        )
+
+    embed = discord.Embed(
+        title="🏆 MKUC チーム得点ランキング",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+        timestamp=now_jst(),
+    )
+
+    embed.set_footer(
+        text=f"登録チーム数：{len(ranking)}"
+    )
 
     await interaction.response.send_message(
-        f"{role.mention}：**{points}点**",
+        embed=embed,
         ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
