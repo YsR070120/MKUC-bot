@@ -1970,7 +1970,7 @@ async def announce_matching_result(
     guild,
     slot,
     match_count,
-    bye_count,
+    bye_role_id=None,
 ):
     config = get_config(guild.id)
 
@@ -1985,11 +1985,36 @@ async def announce_matching_result(
     if channel is None:
         return
 
-    await channel.send(
+    # 各時間帯の実際の部屋作成時刻
+    deadline_hour, _ = DEADLINES[slot]
+    room_time = f"{deadline_hour}:{ROOM_MINUTE:02d}"
+
+    message = (
         f"🔀 **{slot}時枠の組み分けが完了しました。**\n"
         f"対戦数：{match_count}組\n"
-        f"組み分け漏れ：{bye_count}チーム\n"
-        f"対戦部屋は **{slot}時55分** に作成されます。",
+    )
+
+    # 組み分け漏れがある場合のみ、チーム名を表示する。
+    # ロール名を文字列として表示するため、メンションされない。
+    if bye_role_id is not None:
+        bye_role = guild.get_role(bye_role_id)
+
+        if bye_role is not None:
+            message += (
+                f"組み分け漏れチーム：{bye_role.name}\n"
+            )
+        else:
+            message += (
+                f"組み分け漏れチーム："
+                f"削除済みロール（ID: {bye_role_id}）\n"
+            )
+
+    message += (
+        f"対戦部屋は **{room_time}** に作成されます。"
+    )
+
+    await channel.send(
+        message,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
@@ -2023,7 +2048,7 @@ async def run_matching(guild, date, slot):
 
     if not teams:
         mark_job_completed(guild.id, date, job_name)
-        await announce_matching_result(guild, slot, 0, 0)
+        await announce_matching_result(guild, slot, 0)
         return
 
     bye_team = None
@@ -2114,7 +2139,7 @@ async def run_matching(guild, date, slot):
         guild,
         slot,
         len(pairs),
-        1 if bye_team is not None else 0,
+        bye_team,
     )
 
     log.info(
