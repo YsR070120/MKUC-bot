@@ -2415,15 +2415,14 @@ async def create_match_room(
 
     message = (
         f"{role_a.mention} {role_b.mention}\n\n"
-        f"**MKUC 対戦部屋**\n"
+        f"**MKUC 予選Room**\n"
         f"日程：{date}\n"
         f"時間：{slot}時枠\n"
         f"Room：{room_no}\n\n"
         f"**Host：** {host_role.mention}\n\n"
-        "150cc / 2チーム戦 / ノーマルアイテム / CPUなし\n"
+        "150cc / 2チーム戦 / ノーマルアイテム / CPUなし / インターバル 10秒\n"
         "12レースで対戦してください。\n"
-        "インターバルは10秒です。\n\n"
-        "リザルト提出は、MKUCサーバーのリザルト投稿用チャンネルで行ってください。"
+        "リザルト提出は、リザルト投稿用のチャンネルで行ってください。"
     )
 
     try:
