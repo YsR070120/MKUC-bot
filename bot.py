@@ -1989,7 +1989,7 @@ async def announce_matching_result(
         f"🔀 **{slot}時枠の組み分けが完了しました。**\n"
         f"対戦数：{match_count}組\n"
         f"組み分け漏れ：{bye_count}チーム\n"
-        f"対戦部屋は **{slot}時58分** に作成されます。",
+        f"対戦部屋は **{slot}時55分** に作成されます。",
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
@@ -2276,7 +2276,7 @@ async def late_match_uc(
         )
         return
 
-    # 58分を過ぎていれば、その場で部屋を作成する。
+    # 55分を過ぎていれば、その場で部屋を作成する。
     current = now_jst()
     deadline_hour, _ = DEADLINES[slot]
 
@@ -2442,7 +2442,7 @@ async def create_match_room(
 
 async def run_room_creation(guild, date, slot):
     """
-    58分の対戦部屋作成処理。
+    55分の対戦部屋作成処理。
 
     作成済みの部屋が存在すれば再作成しない。
     作成失敗したカードは次回の処理で再試行できるようにする。
@@ -2612,13 +2612,13 @@ async def scheduler_loop():
     毎日12:00：募集開始通知
 
     20:54：21時枠マッチング
-    20:58：21時枠の部屋作成
+    20:55：21時枠の部屋作成
 
     21:54：22時枠マッチング
-    21:58：22時枠の部屋作成
+    21:55：22時枠の部屋作成
 
     22:54：23時枠マッチング
-    22:58：23時枠の部屋作成
+    22:55：23時枠の部屋作成
     """
 
     await bot.wait_until_ready()
