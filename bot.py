@@ -1320,44 +1320,50 @@ async def list_uc(interaction: discord.Interaction):
             (guild_id, date, slot),
         ).fetchall()
 
-        # 一般参加者には、自分のチームの挙手だけを表示
+        # 全体の挙手数を集計するため、絞り込む前に記録する
+        total_count = len(rows)
+
+        # 参加者の場合、自分のチームが挙手しているか確認する
         if not admin:
-            rows = [
-                row
+            my_signup = any(
+                row[0] == my_team_role.id
                 for row in rows
-                if row[0] == my_team_role.id
-            ]
-
-        team_names = []
-
-        for role_id, created_at in rows:
-            role = guild.get_role(role_id)
-
-            if role is None:
-                team_names.append(
-                    f"⚠️ 削除済みロール（ID: {role_id}）"
-                )
-                continue
-
-            team_names.append(role.mention)
-            total_teams.add(role_id)
-
-        if team_names:
-            value = "\n".join(
-                f"{index}. {name}"
-                for index, name in enumerate(
-                    team_names,
-                    start=1,
-                )
             )
-        else:
-            if admin:
-                value = "挙手しているチームはありません。"
+
+            if my_signup:
+                value = f"自分のチーム：{my_team_role.mention}"
             else:
                 value = "この時間帯には挙手していません。"
 
+        else:
+            # 運営には、従来どおり全チームを表示する
+            team_names = []
+
+            for role_id, created_at in rows:
+                role = guild.get_role(role_id)
+
+                if role is None:
+                    team_names.append(
+                        f"⚠️ 削除済みロール（ID: {role_id}）"
+                    )
+                    continue
+
+                team_names.append(role.mention)
+                total_teams.add(role_id)
+
+            if team_names:
+                value = "\n".join(
+                    f"{index}. {name}"
+                    for index, name in enumerate(
+                        team_names,
+                        start=1,
+                    )
+                )
+            else:
+                value = "挙手しているチームはありません。"
+
         embed.add_field(
-            name=f"🕒 {slot}時枠（{len(rows)}チーム）",
+            name=f"🕒 {slot}時枠（{total_count}チーム）",
             value=value,
             inline=False,
         )
