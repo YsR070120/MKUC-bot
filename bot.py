@@ -1236,12 +1236,12 @@ async def refresh_uc(interaction: discord.Interaction):
     )
 
 # ============================================================
-# 挙手チーム一覧（運営用）
+# 挙手チーム一覧（運営・一般参加者用）
 # ============================================================
 
 @bot.tree.command(
     name="list-uc",
-    description="本日、挙手しているチームを時間帯ごとに確認します（運営用）",
+    description="本日、挙手しているチームを確認します",
 )
 async def list_uc(interaction: discord.Interaction):
     if interaction.guild is None:
@@ -1251,16 +1251,36 @@ async def list_uc(interaction: discord.Interaction):
         )
         return
 
-    if not await require_admin(interaction):
-        return
-
     guild = interaction.guild
     guild_id = guild.id
     date = today_str()
 
+    # 運営かどうかを判定
+    admin = is_admin(interaction)
+
+    # 一般参加者の場合、自分のチームロールを取得
+    my_team_role = None
+
+    if not admin:
+        my_team_role, error = get_team_role_from_interaction(interaction)
+
+        if error:
+            await interaction.response.send_message(
+                error,
+                ephemeral=True,
+            )
+            return
+
     embed = discord.Embed(
         title="📋 MKUC 本日の挙手チーム一覧",
-        description=f"日付：{date}（日本時間）",
+        description=(
+            f"日付：{date}（日本時間）\n"
+            + (
+                "表示範囲：全チーム（運営用）"
+                if admin
+                else f"表示範囲：{my_team_role.name}"
+            )
+        ),
         color=discord.Color.blue(),
         timestamp=now_jst(),
     )
@@ -1278,30 +1298,41 @@ async def list_uc(interaction: discord.Interaction):
             (guild_id, date, slot),
         ).fetchall()
 
+        # 一般参加者には、自分のチームの挙手だけを表示
+        if not admin:
+            rows = [
+                row
+                for row in rows
+                if row[0] == my_team_role.id
+            ]
+
         team_names = []
 
         for role_id, created_at in rows:
             role = guild.get_role(role_id)
 
-            # ロールが削除されている場合
             if role is None:
                 team_names.append(
                     f"⚠️ 削除済みロール（ID: {role_id}）"
                 )
                 continue
 
-            # チームロール登録が解除されている場合も、
-            # 挙手データが残っていれば確認できるようにする。
             team_names.append(role.mention)
             total_teams.add(role_id)
 
         if team_names:
             value = "\n".join(
                 f"{index}. {name}"
-                for index, name in enumerate(team_names, start=1)
+                for index, name in enumerate(
+                    team_names,
+                    start=1,
+                )
             )
         else:
-            value = "挙手しているチームはありません。"
+            if admin:
+                value = "挙手しているチームはありません。"
+            else:
+                value = "この時間帯には挙手していません。"
 
         embed.add_field(
             name=f"🕒 {slot}時枠（{len(rows)}チーム）",
@@ -1309,9 +1340,14 @@ async def list_uc(interaction: discord.Interaction):
             inline=False,
         )
 
-    embed.set_footer(
-        text=f"挙手データがあるチーム数（重複除く）：{len(total_teams)}"
-    )
+    if admin:
+        embed.set_footer(
+            text=f"挙手データがあるチーム数（重複除く）：{len(total_teams)}"
+        )
+    else:
+        embed.set_footer(
+            text="自分のチームの挙手状況を表示しています。"
+        )
 
     await interaction.response.send_message(
         embed=embed,
