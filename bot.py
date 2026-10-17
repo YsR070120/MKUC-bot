@@ -1015,8 +1015,30 @@ async def setup_uc(
     room_category: discord.CategoryChannel = None,
     staff_role: discord.Role = None,
 ):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
     if not await require_admin(interaction):
         return
+
+    # 選択されたロールが現在のサーバーに存在するか確認
+    if staff_role is not None:
+        actual_role = interaction.guild.get_role(staff_role.id)
+
+        if actual_role is None:
+            await interaction.response.send_message(
+                f"❌ 運営ロールを取得できませんでした。\n"
+                f"ロール名：{staff_role.name}\n"
+                f"ロールID：{staff_role.id}",
+                ephemeral=True,
+            )
+            return
+
+        staff_role = actual_role
 
     set_config(
         interaction.guild.id,
