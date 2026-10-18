@@ -993,6 +993,357 @@ async def d_uc(
             interaction.channel,
         )
 
+# ============================================================
+# チームロール選択
+# ============================================================
+
+ROLE_SELECT_TITLE = "チームのロールを選んでください"
+
+
+class TeamRoleButton(discord.ui.Button):
+    """チームロールを付与するボタン。"""
+
+    def __init__(self, role_id: int, role_name: str, row: int):
+        super().__init__(
+            label=role_name[:80],
+            style=discord.ButtonStyle.primary,
+            custom_id=f"mkuc:team_role:{role_id}",
+            row=row,
+        )
+        self.role_id = role_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "サーバー内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        member = interaction.user
+
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "メンバー情報を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        # ボタンを押した時点で、そのロールが登録されているか再確認する。
+        registered = get_team_role_ids(guild.id)
+
+        if self.role_id not in registered:
+            await interaction.response.send_message(
+                "このチームロールは登録されていません。運営に確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        target_role = guild.get_role(self.role_id)
+
+        if target_role is None:
+            await interaction.response.send_message(
+                "このチームロールは削除されているため、付与できません。",
+                ephemeral=True,
+            )
+            return
+
+        # 現在持っている登録済みチームロールを確認する。
+        current_team_roles = [
+            role
+            for role in member.roles
+            if role.id in registered
+        ]
+
+        # すでに同じチームのロールを持っている。
+        if any(role.id == target_role.id for role in current_team_roles):
+            await interaction.response.send_message(
+                f"すでに {target_role.name} のロールを持っています。",
+                ephemeral=True,
+            )
+            return
+
+        # 別チームのロールを持っている場合は付与しない。
+        if current_team_roles:
+            current_names = "、".join(
+                role.name for role in current_team_roles
+            )
+
+            await interaction.response.send_message(
+                f"すでにチームロールを持っています：{current_names}\n"
+                "別のチームに変更する場合は、先に「今のロールを外す」を押してください。",
+                ephemeral=True,
+            )
+            return
+
+                # /setup-uc で設定された参加者ロールを取得する。
+        config = get_config(guild.id)
+
+        if not config or not config["participant_role_id"]:
+            await interaction.response.send_message(
+                "❌ 参加者ロールが設定されていません。\n"
+                "運営に `/setup-uc` の設定を確認してもらってください。",
+                ephemeral=True,
+            )
+            return
+
+        participant_role = guild.get_role(
+            config["participant_role_id"]
+        )
+
+        if participant_role is None:
+            await interaction.response.send_message(
+                "❌ 設定された参加者ロールが見つかりません。\n"
+                "運営に `/setup-uc` の設定を確認してもらってください。",
+                ephemeral=True,
+            )
+            return
+
+        # チームロールと参加者ロールを同時に付与する。
+        roles_to_add = [target_role]
+
+        # 参加者ロールをすでに持っている場合は、重複して追加しない。
+        if participant_role not in member.roles:
+            roles_to_add.append(participant_role)
+
+        try:
+            await member.add_roles(
+                *roles_to_add,
+                reason="MKUC チームロール選択",
+            )
+
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ ロールを付与できませんでした。\n"
+                "Botに「ロールの管理」権限があるか、"
+                "Botのロールが付与対象のロールより上にあるか確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "❌ ロールの付与に失敗しました。時間をおいて再度お試しください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ {target_role.name} のチームロールを付与しました！\n"
+            f"✅ {participant_role.name} の参加者ロールも付与しました！",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+
+class RemoveTeamRoleButton(discord.ui.Button):
+    """自分のチームロールを外すボタン。"""
+
+    def __init__(self):
+        super().__init__(
+            label="今のロールを外す",
+            style=discord.ButtonStyle.danger,
+            custom_id="mkuc:remove_team_role",
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "サーバー内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.user
+
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "メンバー情報を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        registered = get_team_role_ids(interaction.guild.id)
+
+        current_roles = [
+            role
+            for role in member.roles
+            if role.id in registered
+        ]
+
+        if not current_roles:
+            await interaction.response.send_message(
+                "外せるチームロールを持っていません。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await member.remove_roles(
+                *current_roles,
+                reason="MKUC チームロール解除",
+            )
+
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "❌ ロールを外せませんでした。\n"
+                "Botに「ロールの管理」権限があるか確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        except discord.HTTPException:
+            await interaction.response.send_message(
+                "ロールの解除に失敗しました。時間をおいて再度お試しください。",
+                ephemeral=True,
+            )
+            return
+
+        removed_names = "、".join(
+            role.name for role in current_roles
+        )
+
+        await interaction.response.send_message(
+            f"✅ 次のチームロールを外しました：{removed_names}",
+            ephemeral=True,
+        )
+
+
+class CheckTeamRoleButton(discord.ui.Button):
+    """自分のチームロールを確認するボタン。"""
+
+    def __init__(self):
+        super().__init__(
+            label="ロールを確認",
+            style=discord.ButtonStyle.secondary,
+            custom_id="mkuc:check_team_role",
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "サーバー内で使用してください。",
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.user
+        registered = get_team_role_ids(interaction.guild.id)
+
+        current_roles = [
+            role
+            for role in member.roles
+            if role.id in registered
+        ]
+
+        if current_roles:
+            message = (
+                "現在持っているチームロール：\n"
+                + "\n".join(
+                    f"・{role.name}"
+                    for role in current_roles
+                )
+            )
+        else:
+            message = "現在、チームロールを持っていません。"
+
+        await interaction.response.send_message(
+            message,
+            ephemeral=True,
+        )
+
+
+class TeamRoleSelectView(discord.ui.View):
+    """チームロール選択用の永続View。"""
+
+    def __init__(self, roles=None):
+        super().__init__(timeout=None)
+
+        if roles is None:
+            roles = []
+
+        # チームロールのボタンは最大20個。
+        # 補助ボタン用に1行確保する。
+        for index, role in enumerate(roles[:20]):
+            row = index // 5
+
+            self.add_item(
+                TeamRoleButton(
+                    role_id=role.id,
+                    role_name=role.name,
+                    row=row,
+                )
+            )
+
+        self.add_item(RemoveTeamRoleButton())
+        self.add_item(CheckTeamRoleButton())
+
+
+@bot.tree.command(
+    name="roleselect-uc",
+    description="チームロール選択用のメッセージを投稿します",
+)
+async def roleselect_uc(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "サーバー内で使用してください。",
+            ephemeral=True,
+        )
+        return
+
+    if not await require_admin(interaction):
+        return
+
+    registered = get_team_role_ids(interaction.guild.id)
+
+    roles = []
+
+    for role_id in registered:
+        role = interaction.guild.get_role(role_id)
+
+        if role is not None:
+            roles.append(role)
+
+    # 表示順をロール名の昇順にする。
+    roles.sort(key=lambda role: role.name.casefold())
+
+    if not roles:
+        await interaction.response.send_message(
+            "チームロールが登録されていません。\n"
+            "先に `/teamrole-uc` でチームロールを登録してください。",
+            ephemeral=True,
+        )
+        return
+
+    description = (
+        "試合に出るには、チームのロールが必要です。"
+        "自分のチームのボタンを押すと、ロールが付きます。\n"
+        "・すでにチームのロールを持っているときは、ほかのチームのロールには変えられません。"
+        "先に「今のロールを外す」を押してください。\n"
+        "・いまのロールは、「ロールを確認」で見られます（本人にだけ見えます）"
+    )
+
+    embed = discord.Embed(
+        title=ROLE_SELECT_TITLE,
+        description=description,
+        color=discord.Color.blue(),
+    )
+
+    view = TeamRoleSelectView(roles)
+
+    await interaction.channel.send(
+        embed=embed,
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    await interaction.response.send_message(
+        "✅ チームロール選択メッセージを投稿しました。",
+        ephemeral=True,
+    )
 
 # ============================================================
 # 運営設定
@@ -2942,6 +3293,10 @@ async def on_guild_join(guild):
 
 async def main():
     global scheduler_task
+
+    # 永続Viewを登録する。
+    # 既存メッセージのボタンも、Bot再起動後に動作する。
+    bot.add_view(TeamRoleSelectView())
 
     if not TOKEN:
         raise RuntimeError(
