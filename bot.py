@@ -2022,7 +2022,7 @@ async def scoreview_uc(
 
         await interaction.response.send_message(
             embed=embed,
-            ephemeral=True,
+            ephemeral=not is_admin(interaction),
             allowed_mentions=discord.AllowedMentions.none(),
         )
         return
@@ -2085,7 +2085,7 @@ async def scoreview_uc(
 
     await interaction.response.send_message(
         embed=embed,
-        ephemeral=True,
+        ephemeral=not is_admin(interaction),
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
