@@ -1845,12 +1845,15 @@ def parse_score_entries(guild, text):
 
 @bot.tree.command(
     name="score-uc",
-    description="複数チームの得点を登録・更新します",
+    description="複数チームの得点を加算します",
 )
 @app_commands.describe(
-    entries="例：@CHU 491 @KU 493（複数指定可能）",
+    entries="例：@KU 493 @CHU 491（指定した点数を加算）",
 )
-async def score_uc(interaction: discord.Interaction, entries: str):
+async def score_uc(
+    interaction: discord.Interaction,
+    entries: str,
+):
     if interaction.guild is None:
         await interaction.response.send_message(
             "サーバー内で使用してください。",
@@ -1862,7 +1865,10 @@ async def score_uc(interaction: discord.Interaction, entries: str):
         return
 
     try:
-        parsed = parse_score_entries(interaction.guild, entries)
+        parsed = parse_score_entries(
+            interaction.guild,
+            entries,
+        )
     except ValueError as exc:
         await interaction.response.send_message(
             f"❌ {exc}",
@@ -1870,9 +1876,11 @@ async def score_uc(interaction: discord.Interaction, entries: str):
         )
         return
 
-    registered = get_team_role_ids(interaction.guild.id)
+    guild_id = interaction.guild.id
+    registered = get_team_role_ids(guild_id)
 
-    for role, _ in parsed:
+    # 全チームを検証してから加算する。
+    for role, points in parsed:
         if role.id not in registered:
             await interaction.response.send_message(
                 f"❌ {role.mention} はチームロールとして登録されていません。",
@@ -1880,17 +1888,49 @@ async def score_uc(interaction: discord.Interaction, entries: str):
             )
             return
 
-    # 全ロールを検証してから更新する。
+    # 同じチームが複数回指定された場合も、指定分を合算する。
+    additions = {}
+
     for role, points in parsed:
-        set_team_score(interaction.guild.id, role.id, points)
+        if role.id not in additions:
+            additions[role.id] = {
+                "role": role,
+                "points": 0,
+            }
+
+        additions[role.id]["points"] += points
+
+    # 現在の得点に加算する。
+    results = []
+
+    for role_id, data in additions.items():
+        role = data["role"]
+        added_points = data["points"]
+
+        current_points = get_team_score(
+            guild_id,
+            role_id,
+        )
+
+        new_points = current_points + added_points
+
+        set_team_score(
+            guild_id,
+            role_id,
+            new_points,
+        )
+
+        results.append(
+            f"{role.mention}："
+            f"{current_points}点 → **{new_points}点**"
+            f"（+{added_points}点）"
+        )
 
     await interaction.response.send_message(
-        "✅ 得点を登録・更新しました。\n"
-        + "\n".join(
-            f"{role.mention}：**{points}点**"
-            for role, points in parsed
-        ),
+        "✅ 得点を加算しました！\n"
+        + "\n".join(results),
         ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
