@@ -491,16 +491,35 @@ def get_refresh_lock(guild_id):
 
 
 def is_admin(interaction):
-    return (
-        interaction.guild is not None
-        and interaction.user.guild_permissions.manage_guild
+    if interaction.guild is None:
+        return False
+
+    # サーバー管理権限を持っている場合は許可
+    if interaction.user.guild_permissions.manage_guild:
+        return True
+
+    # setupで設定された運営ロールを確認
+    config = get_config(interaction.guild.id)
+
+    if config is None:
+        return False
+
+    staff_role_id = config.get("staff_role_id")
+
+    if staff_role_id is None:
+        return False
+
+    # 運営ロールを持っていれば許可
+    return any(
+        role.id == staff_role_id
+        for role in getattr(interaction.user, "roles", [])
     )
 
 
 async def require_admin(interaction):
     if not is_admin(interaction):
         await interaction.response.send_message(
-            "運営のみ使用できます。サーバー管理権限が必要です。",
+            "運営のみ使用できます。運営ロールまたはサーバー管理権限が必要です。",
             ephemeral=True,
         )
         return False
