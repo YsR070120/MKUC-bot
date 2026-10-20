@@ -1948,7 +1948,7 @@ async def score_uc(
     await interaction.response.send_message(
         "✅ 得点を加算しました！\n"
         + "\n".join(results),
-        ephemeral=True,
+        ephemeral=False,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
@@ -2257,20 +2257,20 @@ def get_signup_order(guild_id, date, slot, role_id):
 
 def choose_bye_team(guild_id, date, slot, teams):
     """
-    奇数チームの除外先を決定する。
+    奇数チームの組み分け漏れを決定する。
 
-    通常モード：
-      規定試合数による除外候補のうち、挙手が最も遅いチーム。
+    2000点モードOFF：
+        全チームのうち、挙手が最も遅いチームを除外。
 
-    2000点モード：
-      除外候補の中に2000点以上のチームがいれば、
-      その中で挙手が最も遅いチーム。
-      いなければ除外候補全体から挙手が最も遅いチーム。
+    2000点モードON：
+        2000点以上のチームが存在すれば、
+        その中で挙手が最も遅いチームを除外。
+        存在しなければ、全チームから挙手が最も遅いチームを除外。
 
-    3チームの場合の再戦回避は、この関数の後に別途処理する。
+    規定試合数と再戦回避は判定に使用しない。
     """
 
-    candidates = get_exclusion_candidates(guild_id, teams)
+    candidates = list(teams)
 
     if high_score_mode_enabled(guild_id):
         high_score_candidates = [
@@ -2282,7 +2282,6 @@ def choose_bye_team(guild_id, date, slot, teams):
         if high_score_candidates:
             candidates = high_score_candidates
 
-    # 挙手時刻が遅い順。同時刻ならrole_idで安定化。
     return max(
         candidates,
         key=lambda role_id: (
@@ -2290,91 +2289,6 @@ def choose_bye_team(guild_id, date, slot, teams):
             role_id,
         ),
     )
-
-
-def choose_bye_for_three(guild_id, date, slot, teams):
-    """
-    3チーム専用処理。
-
-    1. 規定試合数による除外候補を決める。
-    2. 2000点モードが有効なら、候補内の2000点以上を優先する。
-    3. 原則として候補のうち挙手が最も遅いチームを仮除外する。
-    4. 各候補を除外した場合の残り2チームの当日対戦回数を比較。
-    5. 最小回数が同じ場合は、挙手が最も遅いチームを除外する。
-    """
-
-    candidates = get_exclusion_candidates(guild_id, teams)
-
-    if high_score_mode_enabled(guild_id):
-        high_score_candidates = [
-            role_id
-            for role_id in candidates
-            if get_team_score(guild_id, role_id) >= HIGH_SCORE_THRESHOLD
-        ]
-
-        if high_score_candidates:
-            candidates = high_score_candidates
-
-    # 仮除外チームを最初に決める。
-    provisional = max(
-        candidates,
-        key=lambda role_id: (
-            get_signup_order(guild_id, date, slot, role_id),
-            role_id,
-        ),
-    )
-
-    options = []
-
-    for bye_role in candidates:
-        remaining = [
-            role_id
-            for role_id in teams
-            if role_id != bye_role
-        ]
-
-        if len(remaining) != 2:
-            continue
-
-        same_day_count = get_daily_pair_count(
-            guild_id,
-            date,
-            remaining[0],
-            remaining[1],
-        )
-
-        options.append(
-            (
-                same_day_count,
-                get_signup_order(
-                    guild_id,
-                    date,
-                    slot,
-                    bye_role,
-                ),
-                bye_role,
-            )
-        )
-
-    if not options:
-        return provisional
-
-    # 同日対戦回数が最小の案を優先。
-    minimum_count = min(item[0] for item in options)
-
-    best_options = [
-        item
-        for item in options
-        if item[0] == minimum_count
-    ]
-
-    # 同点なら挙手が最も遅いチームを除外。
-    selected = max(
-        best_options,
-        key=lambda item: (item[1], item[2]),
-    )[2]
-
-    return selected
 
 
 # ============================================================
@@ -2566,7 +2480,7 @@ def mark_job_completed(guild_id, date, job):
 async def announce_matching_result(
     guild,
     slot,
-    match_count,
+    pairs,
     bye_role_id=None,
 ):
     config = get_config(guild.id)
@@ -2588,26 +2502,54 @@ async def announce_matching_result(
 
     message = (
         f"🔀 **{slot}時枠の組み分けが完了しました。**\n"
-        f"対戦数：{match_count}組\n"
+        f"対戦数：{len(pairs)}組\n"
     )
 
-    # 組み分け漏れがある場合のみ、チーム名を表示する。
-    # ロール名を文字列として表示するため、メンションされない。
+    # 対戦カードを表示
+    if pairs:
+        message += "\n**対戦カード**\n"
+
+        for index, (role_a, role_b) in enumerate(
+            pairs,
+            start=1,
+        ):
+            team_a = guild.get_role(role_a)
+            team_b = guild.get_role(role_b)
+
+            name_a = (
+                team_a.name
+                if team_a is not None
+                else f"削除済みロール（ID: {role_a}）"
+            )
+
+            name_b = (
+                team_b.name
+                if team_b is not None
+                else f"削除済みロール（ID: {role_b}）"
+            )
+
+            message += (
+                f"{index}. {name_a} vs {name_b}\n"
+            )
+    else:
+        message += "\n対戦カードはありません。\n"
+
+    # 組み分け漏れチームを表示
     if bye_role_id is not None:
         bye_role = guild.get_role(bye_role_id)
 
         if bye_role is not None:
             message += (
-                f"組み分け漏れチーム：{bye_role.name}\n"
+                f"\n**組み分け漏れチーム：{bye_role.name}**\n"
             )
         else:
             message += (
-                f"組み分け漏れチーム："
-                f"削除済みロール（ID: {bye_role_id}）\n"
+                f"\n**組み分け漏れチーム："
+                f"削除済みロール（ID: {bye_role_id}）**\n"
             )
 
     message += (
-        f"対戦部屋は **{room_time}** に作成されます。"
+        f"\n対戦部屋は **{room_time}** に作成されます。"
     )
 
     await channel.send(
@@ -2645,26 +2587,18 @@ async def run_matching(guild, date, slot):
 
     if not teams:
         mark_job_completed(guild.id, date, job_name)
-        await announce_matching_result(guild, slot, 0)
+        await announce_matching_result(guild, slot, [])
         return
 
     bye_team = None
 
     if len(teams) % 2 == 1:
-        if len(teams) == 3:
-            bye_team = choose_bye_for_three(
-                guild.id,
-                date,
-                slot,
-                teams,
-            )
-        else:
-            bye_team = choose_bye_team(
-                guild.id,
-                date,
-                slot,
-                teams,
-            )
+        bye_team = choose_bye_team(
+            guild.id,
+            date,
+            slot,
+            teams,
+        )
 
         teams.remove(bye_team)
 
@@ -2735,7 +2669,7 @@ async def run_matching(guild, date, slot):
     await announce_matching_result(
         guild,
         slot,
-        len(pairs),
+        pairs,
         bye_team,
     )
 
