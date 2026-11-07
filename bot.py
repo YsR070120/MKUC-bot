@@ -335,20 +335,22 @@ async def create_tournament_rooms(guild, operator_id, stage, opening_time, roles
                 view_channel=True, send_messages=True,
                 read_message_history=True, manage_channels=True,
             )
-        for role in roles:
-            overwrites[role] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True,
-                read_message_history=True, attach_files=True,
-                embed_links=True, use_application_commands=True,
-            )
         created = []
         stage_slug = clean_stage_for_channel(stage)
         try:
             for room_no, (role_a, role_b) in enumerate(zip(roles[::2], roles[1::2]), start=1):
+                # 各チャンネルには、その対戦カードの2チームだけを許可します。
+                room_overwrites = dict(overwrites)
+                for role in (role_a, role_b):
+                    room_overwrites[role] = discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True,
+                        read_message_history=True, attach_files=True,
+                        embed_links=True, use_application_commands=True,
+                    )
                 channel = await guild.create_text_channel(
                     name=f"{stage_slug}-room{room_no}"[:100],
                     category=category,
-                    overwrites=overwrites,
+                    overwrites=room_overwrites,
                     reason=f"MKUC {stage} Room {room_no} by {operator_id}",
                 )
                 created.append((channel, room_no, role_a, role_b))
